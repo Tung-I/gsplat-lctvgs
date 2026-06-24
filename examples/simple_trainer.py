@@ -362,13 +362,15 @@ def create_splats_with_optimizers(
         optimizer_class = SelectiveAdam
     else:
         optimizer_class = torch.optim.Adam
+    # fused=True is only supported by torch.optim.Adam, not SelectiveAdam/SparseAdam
+    extra_kwargs = {"fused": True} if optimizer_class is torch.optim.Adam else {}
     optimizers = {
         name: optimizer_class(
             [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
             eps=1e-15 / math.sqrt(BS),
             # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
             betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
-            fused=True,
+            **extra_kwargs,
         )
         for name, _, lr in params
     }
