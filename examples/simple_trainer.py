@@ -81,6 +81,8 @@ class Config:
     disable_viewer: bool = False
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
+    # Path to a single .pt checkpoint to resume training from (continues past that step).
+    resume_ckpt: Optional[str] = None
     # Name of compression strategy to use
     compression: Optional[Literal["png"]] = None
     # Render trajectory path: "interp", "ellipse", "spiral", or "raw" (use captured poses as-is)
@@ -149,10 +151,19 @@ class Config:
 
     # Initialization strategy
     init_type: str = "sfm"
+    # Path to a PLY file for initialization (used when init_type="ply")
+    init_ply_path: str = ""
+    # JSON file listing global camera indices to restrict training to (for block finetuning)
+    cam_indices_file: str = ""
     # Initial number of GSs. Ignored if using sfm
     init_num_pts: int = 100_000
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
     init_extent: float = 3.0
+    # For scenes where the ground plane is at a known Y offset in normalized space,
+    # constrain random init Y to [init_y_center - init_y_spread, init_y_center + init_y_spread].
+    # Set init_y_spread > 0 to enable. Useful for nadir UAV datasets where scene is at Y~1.0.
+    init_y_center: float = 0.0
+    init_y_spread: float = 0.0
     # Degree of spherical harmonics
     sh_degree: int = 3
     # Cast SH coefficients to fp16 before feeding the SH kernel.
@@ -285,8 +296,11 @@ class Config:
 def create_splats_with_optimizers(
     parser: Parser,
     init_type: str = "sfm",
+    init_ply_path: str = "",
     init_num_pts: int = 100_000,
     init_extent: float = 3.0,
+    init_y_center: float = 0.0,
+    init_y_spread: float = 0.0,
     init_opacity: float = 0.1,
     init_scale: float = 1.0,
     means_lr: float = 1.6e-4,
@@ -310,9 +324,79 @@ def create_splats_with_optimizers(
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
     elif init_type == "random":
         points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
+        if init_y_spread > 0.0:
+            # Constrain Y to a thin slab centered at init_y_center (for nadir UAV scenes
+            # where the ground plane is at a known Y offset in normalized space).
+            points[:, 1] = init_y_center + init_y_spread * (torch.rand(init_num_pts) * 2 - 1)
         rgbs = torch.rand((init_num_pts, 3))
+    elif init_type == "ply":
+        # Load full Gaussian model from a pre-trained PLY (for CityGaussian block finetuning).
+        # Uses gsplat's load_ply_to_splats to recover all parameters.
+        from gsplat.exporter import load_ply_to_splats
+        ply_splats = load_ply_to_splats(init_ply_path)
+        points = ply_splats["means"]  # [N, 3]
+        ply_scales = ply_splats["scales"]  # [N, 3], log-scale
+        ply_quats = ply_splats["quats"]  # [N, 4]
+        ply_opacities = ply_splats["opacities"]  # [N,], logit-opacity
+        ply_sh0 = ply_splats["sh0"]  # [N, 1, 3]
+        ply_shN = ply_splats["shN"]  # [N, K-1, 3]
+        N_ply = points.shape[0]
+        print(f"[PLY init] Loaded {N_ply} Gaussians from {init_ply_path}")
+
+        # Distribute across ranks
+        idx = list(range(world_rank, N_ply, world_size))
+        points = points[idx]
+        ply_scales = ply_scales[idx]
+        ply_quats = ply_quats[idx]
+        ply_opacities = ply_opacities[idx]
+        ply_sh0 = ply_sh0[idx]
+        ply_shN = ply_shN[idx]
+        N = points.shape[0]
+
+        params = [
+            ("means", torch.nn.Parameter(points), means_lr * scene_scale),
+            ("scales", torch.nn.Parameter(ply_scales), scales_lr),
+            ("quats", torch.nn.Parameter(ply_quats), quats_lr),
+            ("opacities", torch.nn.Parameter(ply_opacities), opacities_lr),
+        ]
+        if feature_dim is None:
+            # Pad/trim shN to match requested sh_degree
+            K = (sh_degree + 1) ** 2 - 1  # number of rest SH bands
+            if ply_shN.shape[1] < K:
+                pad = torch.zeros(N, K - ply_shN.shape[1], 3)
+                ply_shN = torch.cat([ply_shN, pad], dim=1)
+            else:
+                ply_shN = ply_shN[:, :K, :]
+            params.append(("sh0", torch.nn.Parameter(ply_sh0), sh0_lr))
+            params.append(("shN", torch.nn.Parameter(ply_shN), shN_lr))
+        else:
+            rgbs = (ply_sh0.squeeze(1) * 0.28209479177387814 + 0.5).clamp(0, 1)
+            features = torch.rand(N, feature_dim)
+            params.append(("features", torch.nn.Parameter(features), sh0_lr))
+            params.append(("colors", torch.nn.Parameter(torch.logit(rgbs)), sh0_lr))
+
+        splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
+        BS = batch_size * world_size
+        optimizer_class = None
+        if sparse_grad:
+            optimizer_class = torch.optim.SparseAdam
+        elif visible_adam:
+            optimizer_class = SelectiveAdam
+        else:
+            optimizer_class = torch.optim.Adam
+        extra_kwargs = {"fused": True} if optimizer_class is torch.optim.Adam else {}
+        optimizers = {
+            name: optimizer_class(
+                [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
+                eps=1e-15 / math.sqrt(BS),
+                betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+                **extra_kwargs,
+            )
+            for name, _, lr in params
+        }
+        return splats, optimizers
     else:
-        raise ValueError("Please specify a correct init_type: sfm, random, or lidar")
+        raise ValueError("Please specify a correct init_type: sfm, random, lidar, or ply")
 
     # Initialize the GS size to be the average dist of the 3 nearest neighbors
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
@@ -453,6 +537,16 @@ class Runner:
                 patch_size=cfg.patch_size,
                 load_depths=cfg.depth_loss,
             )
+            if cfg.cam_indices_file:
+                import json as _json
+                with open(cfg.cam_indices_file) as _f:
+                    _block_info = _json.load(_f)
+                _allowed = set(_block_info["global_indices"])
+                self.trainset.indices = np.array(
+                    [i for i in self.trainset.indices if i in _allowed]
+                )
+                print(f"[Block filter] Restricted to {len(self.trainset.indices)} cameras "
+                      f"from {cfg.cam_indices_file}")
             self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
@@ -481,8 +575,11 @@ class Runner:
         self.splats, self.optimizers = create_splats_with_optimizers(
             self.parser,
             init_type=cfg.init_type,
+            init_ply_path=cfg.init_ply_path,
             init_num_pts=cfg.init_num_pts,
             init_extent=cfg.init_extent,
+            init_y_center=cfg.init_y_center,
+            init_y_spread=cfg.init_y_spread,
             init_opacity=cfg.init_opa,
             init_scale=cfg.init_scale,
             means_lr=cfg.means_lr,
@@ -809,10 +906,45 @@ class Runner:
         max_steps = cfg.max_steps
         init_step = 0
 
+        # Resume from a checkpoint: restore splat parameters and seek the LR
+        # scheduler forward so training continues exactly where it left off.
+        if cfg.resume_ckpt is not None:
+            ckpt = torch.load(cfg.resume_ckpt, map_location=device, weights_only=False)
+            for k in self.splats.keys():
+                self.splats[k].data = ckpt["splats"][k].to(device)
+            init_step = ckpt["step"] + 1
+            print(f"[Resume] Loaded checkpoint from step {ckpt['step']}. "
+                  f"Resuming from step {init_step}. "
+                  f"Gaussians: {self.splats['means'].shape[0]:,}")
+            if "optimizers" in ckpt:
+                for k, opt in self.optimizers.items():
+                    if k in ckpt["optimizers"]:
+                        opt.load_state_dict(ckpt["optimizers"][k])
+                print("[Resume] Optimizer states restored.")
+            else:
+                # No saved optimizer state: warm-start exp_avg_sq so that the
+                # adaptive step size is not explosive on cold-start (eps=1e-15).
+                # Use 1.0 as initial variance; Adam will correct it within ~1k steps.
+                for opt in self.optimizers.values():
+                    for group in opt.param_groups:
+                        for p in group["params"]:
+                            opt.state[p] = {
+                                "step": torch.tensor(float(init_step)),
+                                "exp_avg": torch.zeros_like(p.data),
+                                "exp_avg_sq": torch.ones_like(p.data),
+                            }
+                print("[Resume] Warm-started optimizer variance (no saved state).")
+            # PyTorch requires 'initial_lr' to exist in param_groups when
+            # constructing a scheduler with last_epoch != -1.
+            for opt in self.optimizers.values():
+                for group in opt.param_groups:
+                    group.setdefault("initial_lr", group["lr"])
+
         schedulers = [
             # means has a learning rate schedule, that end at 0.01 of the initial value
             torch.optim.lr_scheduler.ExponentialLR(
-                self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
+                self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps),
+                last_epoch=init_step - 1,
             ),
         ]
         if cfg.pose_opt:
@@ -1053,6 +1185,10 @@ class Runner:
                     "step": step,
                     "scene_id": self.scene.id,
                     "splats": self.splats.state_dict(),
+                    "optimizers": {
+                        k: opt.state_dict()
+                        for k, opt in self.optimizers.items()
+                    },
                 }
                 if cfg.pose_opt:
                     if world_size > 1:
@@ -1170,6 +1306,13 @@ class Runner:
                 )
             else:
                 assert_never(self.cfg.strategy)
+
+            # Free the largest intersection buffers so they don't remain alive during
+            # the NEXT step's forward pass. Without this, step N-1's isect_ids/flatten_ids
+            # (~20-30 GB at large Gaussian counts) coexist with step N's allocation → OOM.
+            info.pop("isect_ids", None)
+            info.pop("flatten_ids", None)
+            torch.cuda.empty_cache()
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:

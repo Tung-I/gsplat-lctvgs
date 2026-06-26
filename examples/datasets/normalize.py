@@ -79,6 +79,12 @@ def similarity_from_cameras(c2w, strict_scaling=False, center_method="focus"):
 
 
 def align_principal_axes(point_cloud):
+    # Drop non-finite points (NaN/Inf from degenerate COLMAP reconstructions)
+    mask = np.all(np.isfinite(point_cloud), axis=1)
+    point_cloud = point_cloud[mask]
+    if len(point_cloud) < 3:
+        return np.eye(4)
+
     # Compute centroid
     centroid = np.median(point_cloud, axis=0)
 
@@ -89,7 +95,10 @@ def align_principal_axes(point_cloud):
     covariance_matrix = np.cov(translated_point_cloud, rowvar=False)
 
     # Compute eigenvectors and eigenvalues
-    eigenvalues, eigenvectors = np.linalg.eigh(covariance_matrix)
+    try:
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance_matrix)
+    except np.linalg.LinAlgError:
+        return np.eye(4)
 
     # Sort eigenvectors by eigenvalues (descending order) so that the z-axis
     # is the principal axis with the smallest eigenvalue.
